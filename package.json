@@ -1,6 +1,6 @@
 {
   "name": "tinymemory",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "TinyMemory — a lightweight, secret-safe, cross-session memory guard for AI coding agents (pi-coding-agent extension + validation CLI).",
   "type": "module",
   "main": "index.ts",

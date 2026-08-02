@@ -88,12 +88,16 @@ if (factIdSet.size !== factIds.length) errors.push('.pi/memory/FACTS.md: duplica
 const replacedIds = new Set(factMeta.flatMap((match) => match[6] ? [match[6]] : []));
 const replaceCounts = new Map();
 const replaceTargets = new Map();
-for (const match of factMeta) {
+for (const [index, match] of factMeta.entries()) {
   const id = match[1];
   const verified = match[2];
   const ttl = Number(match[3]);
   const replaces = match[6];
   const ageDays = calendarAgeDays(verified, today);
+  // UNVERIFIED 豁免：块内 `> Status: UNVERIFIED` 表示未复核，TTL 过期降级为 warning 而非 error
+  // （与架构约定“过期后必须复验或标记 UNVERIFIED”对齐；标记后仍应尽快复核）。
+  const blockEnd = index + 1 < factMeta.length ? (factMeta[index + 1].index ?? facts.length) : facts.length;
+  const unverified = /^> Status: UNVERIFIED$/m.test(facts.slice(match.index ?? 0, blockEnd));
   if (!Number.isFinite(ageDays) || ageDays < 0) {
     errors.push(`.pi/memory/FACTS.md: ${id} has invalid or future Verified date ${verified}`);
   }
@@ -104,7 +108,11 @@ for (const match of factMeta) {
     replaceTargets.set(id, replaces);
   }
   if (Number.isFinite(ageDays) && ageDays >= 0 && !replacedIds.has(id) && isMemoryDateExpired(verified, ttl, today)) {
-    errors.push(`.pi/memory/FACTS.md: active ${id} verified ${verified} exceeded TTL ${ttl}d`);
+    if (unverified) {
+      warnings.push(`.pi/memory/FACTS.md: ${id} 标记 UNVERIFIED 且已过 TTL（${verified}，${ttl}d）；引用前需复核`);
+    } else {
+      errors.push(`.pi/memory/FACTS.md: active ${id} verified ${verified} exceeded TTL ${ttl}d`);
+    }
   }
 }
 for (const [id, count] of replaceCounts) {

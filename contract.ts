@@ -12,6 +12,9 @@ const SECRET_PATTERNS: Array<[string, RegExp]> = [
   ["cookie header", /\b(?:cookie|set-cookie)\s*:\s*\S[^\r\n]*/i],
   ["credential assignment", /(?:password|passwd|api[_ -]?key|secret|token|cookie|密码)\s*[:=]\s*["']?(?!\[?(?:redacted|removed)|见\b|see\b|待轮换\b|路径\b|location\b|file\b)[^\s,;|`"']{4,}/i],
   ["URL credentials", /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i],
+  ["AWS access key", /\bAKIA[0-9A-Z]{16}\b/],
+  ["Slack token", /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/],
+  ["GitLab PAT", /\bglpat-[A-Za-z0-9_-]{20,}\b/],
 ];
 
 export function findSecretRisk(text: string): string | null {

@@ -370,6 +370,16 @@ function nextFactId(facts: Fact[]): string {
 }
 const AUDIT_KEEP = 40;
 const CANDIDATE_KEEP = 60;
+// 蒸馏增量与时间衰减（借鉴 OptMem）：状态文件只记录消息指纹，读取预算按"近期优先"衰减。
+const DISTILL_BRANCH_LOOKBACK = 40; // 蒸馏扫描的最近消息数（增量锚点在窗口内查找）
+const DISTILL_FALLBACK_LOOKBACK = 20; // 无增量状态/增量过短时回退的全量窗口（保持原行为）
+const DISTILL_RECENT_FACTS_DAYS = 14; // Brief 时间衰减窗口：近期验证的事实优先展示
+const DISTILL_CANDIDATE_MAX_AGE_DAYS = 30; // INBOX 蒸馏候选超龄自动降级：超过 N 天未审核视为无价值丢弃
+// FACTS 为提炼层：条目源自对话/事件的稳定结论，原始蒸馏候选留存于 INBOX.jsonl（distilled 类目），
+// 可用 Source 溯源；坏条目用 Replaces 更新（借鉴 OptMem"摘要可重建"：日志保留原始，提炼层可重算）。
+const DEFAULT_FACTS_HEADER = `# 稳定事实
+
+<!-- 提炼层：条目为从对话/事件提炼的稳定结论；原始蒸馏候选留存于 INBOX.jsonl（distilled 类目），可用 Source 溯源。条目过期须复验或用 Replaces 更新，禁止双真相并存。 -->`;
 function observations(file: string): Observation[] {
   // 全量读取（分层后上限 100 行），不再截断最近 20 条——避免旧候选成为不可见僵尸数据。
   return readText(file).split(/\r?\n/).filter(Boolean).flatMap((line) => { try { const value = JSON.parse(line) as Observation; return value.summary ? [value] : []; } catch { return []; } });
@@ -378,17 +388,21 @@ async function appendObservation(file: string, item: Observation): Promise<void>
   await withFileMutationQueue(file, () => withLock(file, () => {
     const lines = readText(file).split(/\r?\n/).filter(Boolean);
     const safe = findContentRisk(item.summary) ? { ...item, summary: `${item.category}: [摘要已脱敏]` } : item;
-    // 全量查重：同 summary 且同分钟视为重复（不再只看最近 20 条）。
-    const duplicate = lines.some((line) => { try { const old = JSON.parse(line) as Observation; return old.summary === safe.summary && old.ts.slice(0, 16) === safe.ts.slice(0, 16); } catch { return false; } });
+    // 全量查重：审计事件同 summary 且同分钟视为重复；蒸馏候选为结论性文本，跨分钟同 summary 也视为重复，
+    // 避免同一结论反复提炼污染 INBOX（保证其作为可重建真相层的干净度）。
+    const duplicate = lines.some((line) => { try { const old = JSON.parse(line) as Observation; return old.summary === safe.summary && (safe.category === "distilled" || old.ts.slice(0, 16) === safe.ts.slice(0, 16)); } catch { return false; } });
     // 同分钟同工具失败只保留一条：防命令链/重试批量触发灌满 INBOX。
     const toolKey = safe.summary.startsWith("工具失败: ") ? safe.summary.split("]")[0] : "";
     const dupMinute = toolKey !== "" && lines.some((line) => { try { const old = JSON.parse(line) as Observation; return old.ts.slice(0, 16) === safe.ts.slice(0, 16) && old.summary.startsWith(toolKey); } catch { return false; } });
     if (duplicate || dupMinute) return;
     // 分层容量：审计事件（tool_failure/config_change）保留最近 40 条，蒸馏候选（distilled）保留最近 60 条。
+    // 蒸馏候选另按时间降级（借鉴 OptMem"读取预算优先"）：超过 DISTILL_CANDIDATE_MAX_AGE_DAYS 未审核视为无价值，自动丢弃。
     const next = [...lines, JSON.stringify(safe)];
     const audit: string[] = []; const candidates: string[] = [];
     for (const line of next) { try { (JSON.parse(line) as Observation).category === "distilled" ? candidates.push(line) : audit.push(line); } catch { audit.push(line); } }
-    const trimmed = [...audit.slice(-AUDIT_KEEP), ...candidates.slice(-CANDIDATE_KEEP)];
+    const cutoff = new Date(Date.now() - DISTILL_CANDIDATE_MAX_AGE_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const candidatesFresh = candidates.filter((line) => { try { const o = JSON.parse(line) as Observation; return o.ts.slice(0, 10) >= cutoff; } catch { return true; } });
+    const trimmed = [...audit.slice(-AUDIT_KEEP), ...candidatesFresh.slice(-CANDIDATE_KEEP)];
     writeAtomically(file, `${trimmed.join("\n")}\n`);
   }));
 }
@@ -399,6 +413,13 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
   let toolsRegistered = false;
   let statusToolRegistered = false;
   let globalToolsRegistered = false;
+  // 进程级注入去重（按会话）：分支扫描失效（getSessionId 短暂不可用、中止/重连、扩展重载）时
+  // 也能保证同一会话在本次进程内不重复注入 brief；session_before_compact 清除一次，
+  // 允许 compaction 后按需补一次以恢复被压缩掉的跨会话背景。
+  // 注意：pi-web 单进程多会话，锁必须按 sessionId 区分，否则同项目第二个会话会拿不到 brief。
+  const injectedKeys = new Set<string>();
+  let currentSessionId: string | undefined;
+  const guardKey = (sessionId?: string) => `${location?.projectKey ?? "?"}:${sessionId ?? currentSessionId ?? "?"}`;
 
   const statusFile = () => join(location!.memoryDir, "STATUS.md");
   const factsFile = () => join(location!.memoryDir, "FACTS.md");
@@ -418,7 +439,9 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
   function hasCustomMessage(ctx: any, customType: string): boolean {
     const id = ctx.sessionManager.getSessionId?.();
     const entries = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries?.() ?? [];
-    return entries.some((entry: any) => entry.type === "custom_message" && entry.customType === customType && entry.details?.sessionId === id);
+    // id 不可用时按保守方向处理：只要分支里存在同类 custom message 就不再重复注入，
+    // 避免中止/重连后 getSessionId 短暂不可用导致同一会话重复注入两份 brief。
+    return entries.some((entry: any) => entry.type === "custom_message" && entry.customType === customType && (!id || entry.details?.sessionId === id));
   }
   function applicableLinks(): ProjectLink[] {
     if (!location) return [];
@@ -441,28 +464,35 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     const factsRisk = findContentRisk(facts);
     return { status, facts, risk: statusRisk ? `STATUS.md: ${statusRisk}` : factsRisk ? `FACTS.md: ${factsRisk}` : null };
   }
-  function selectFacts(tags: string[] = [], limit = MAX_RECALL_FACTS, raw = readText(factsFile())): Fact[] {
+  function selectFacts(tags: string[] = [], limit = MAX_RECALL_FACTS, raw = readText(factsFile()), recentDays = 0): Fact[] {
     const expanded = expandTags(tags);
     const facts = activeFacts(parseFacts(raw));
     const selected = expanded.length ? facts.filter((fact) => fact.tags.some((tag) => expanded.includes(tag))) : facts;
-    return selected.sort((a, b) => a.priority !== b.priority ? (a.priority === "pinned" ? -1 : 1) : b.verified.localeCompare(a.verified)).slice(0, limit);
+    selected.sort((a, b) => a.priority !== b.priority ? (a.priority === "pinned" ? -1 : 1) : b.verified.localeCompare(a.verified));
+    // 时间衰减读取（借鉴 OptMem cover）：recentDays>0 时优先展示近期验证的事实（"最近逐字、远古折叠"），
+    // 近期匹配不足 limit 再补更早事实；pinned 已在排序中保持最前。recall 不启用该窗口（精确召回）。
+    if (recentDays > 0) {
+      const recent = selected.filter((fact) => calendarAgeDays(fact.verified) <= recentDays);
+      if (recent.length) return [...recent, ...selected.filter((fact) => !recent.includes(fact))].slice(0, limit);
+    }
+    return selected.slice(0, limit);
   }
   function hasBrief(ctx: any): boolean { return hasCustomMessage(ctx, "project-memory-brief"); }
   function buildBrief(prompt: string): string {
     const read = safeReadSet();
-    if (read.risk) return wrap("project_memory_brief", `⚠ 已阻止加载项目记忆：检测到 ${read.risk}。本次未输出记忆原文。`, MAX_BRIEF_CHARS);
+    if (read.risk) return wrap("project_memory_brief", `⚠ 已阻止加载项目记忆：检测到 ${read.risk}。`, MAX_BRIEF_CHARS);
     const tags = deriveTags(prompt);
-    const facts = selectFacts(tags, tags.length ? 2 : 1, read.facts);
+    const facts = selectFacts(tags, tags.length ? 2 : 1, read.facts, DISTILL_RECENT_FACTS_DAYS);
     const links = applicableLinks();
     const expiring = expiringCount(read.facts);
+    // 精简版：只保留事实与最小边界说明，去掉与 AGENTS.md/工具描述重复的元指令，
+    // 避免占满 760 字符上限导致截断出半截警告，也降低上下文顶部负担。
     const body = [
-      `这是当前项目（${projectLabel(location!.projectRoot)} / ${location!.projectKey}）的跨会话背景；运行时验证优先，且凭据值不得进入记忆。`,
-      "作用域边界：以下状态和事实只适用于当前项目，禁止外推、复制或混入其他项目。",
-      `当前状态:\n${statusBrief(read.status, tags.length ? 300 : 420)}`,
-      facts.length ? `相关事实:\n${facts.map((fact) => renderFact(fact, 200)).join("\n")}` : "",
-      expiring ? `⚠ ${expiring} 条事实即将到期（剩余 ≤20% TTL）；先复核再引用。` : "",
-      links.length ? `存在 ${links.length} 条已批准项目关联；仅在明确需要时调用 memory-link-recall 读取其最小摘要，禁止假定关联内容。` : "",
-      "需要更多当前项目历史时按标签调用 memory-recall；只保存已验证、可复用的结论。",
+      `当前项目（${projectLabel(location!.projectRoot)} / ${location!.projectKey}）跨会话背景：仅适用于本项目，勿外推到其他项目；凭据不进入记忆。`,
+      `当前状态:\n${statusBrief(read.status, tags.length ? 240 : 320)}`,
+      facts.length ? `相关事实:\n${facts.map((fact) => renderFact(fact, 160)).join("\n")}` : "",
+      expiring ? `⚠ ${expiring} 条事实即将到期（≤20% TTL）；先复核再引用。` : "",
+      links.length ? `项目关联 ${links.length} 条；按需 memory-link-recall 读取最小摘要。` : "",
     ].filter(Boolean).join("\n\n");
     return wrap("project_memory_brief", body, MAX_BRIEF_CHARS);
   }
@@ -533,6 +563,90 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
       },
     });
   }
+  // 蒸馏核心：供 memory-distill 工具与 session_before_compact 压缩前自动蒸馏复用
+  // （借鉴 OptMem nap 的惰性摊销：增量提炼 + 每次少量 + 失败安全）。
+  async function runDistill(ctx: any, signal: any, maxItems: number): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
+    requireSessionProject(ctx);
+    const model = (ctx as any)?.model;
+    const registry = (ctx as any)?.modelRegistry;
+    if (!model || !registry || typeof registry.getApiKeyAndHeaders !== "function") {
+      return { content: [{ type: "text", text: "当前会话无可用模型，蒸馏已跳过（候选不会自动成为事实）。" }], details: { skipped: "no-model" } };
+    }
+    const branch = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries?.() ?? [];
+    const msgs: Array<{ role: string; text: string }> = [];
+    for (const entry of [...branch].slice(-DISTILL_BRANCH_LOOKBACK)) {
+      if (entry?.type !== "message") continue;
+      const msg = entry.message;
+      if (!msg || !("role" in msg)) continue;
+      // 只蒸馏 user/assistant 纯文本；跳过 system（记忆注入、指令）与工具消息，避免状态快照/工具输出被当作事实。
+      if (msg.role !== "user" && msg.role !== "assistant") continue;
+      const text = (Array.isArray(msg.content) ? msg.content : []).filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text).join("\n").trim();
+      if (!text) continue;
+      msgs.push({ role: msg.role, text: text.slice(0, 1200) });
+    }
+    if (!msgs.length) return { content: [{ type: "text", text: "当前会话没有可蒸馏的文本消息。" }], details: { skipped: "no-text" } };
+    // 增量蒸馏（借鉴 OptMem nap 的惰性摊销）：状态文件记录上次处理的最后一条消息指纹，
+    // 本次只蒸馏其后的新消息，并附上已记录候选作为"不要重复"背景；状态缺失/指纹不匹配
+    // （新会话/被压缩）时回退全量窗口，保持原行为。指纹用 role+文本前缀，跨会话/模型稳定。
+    const fingerprint = (role: string, text: string) => createHash("sha256").update(`${role}\u0000${text.slice(0, 400)}`).digest("hex");
+    const stateFile = join(location!.memoryDir, "DISTILL_STATE.json");
+    let lastHash: string | null = null;
+    try { const stored = JSON.parse(readText(stateFile)) as { lastHash?: unknown }; if (typeof stored?.lastHash === "string") lastHash = stored.lastHash; } catch { /* 无状态或损坏：回退全量 */ }
+    const parts = msgs.map((m) => `${m.role === "user" ? "用户" : "助手"}: ${m.text}`);
+    let start = 0;
+    if (lastHash) {
+      const index = msgs.findIndex((m) => fingerprint(m.role, m.text) === lastHash);
+      if (index >= 0) start = index + 1;
+    }
+    const fresh = parts.slice(start);
+    if (lastHash && !fresh.length) {
+      return { content: [{ type: "text", text: "自上次蒸馏以来没有新的可蒸馏消息。" }], details: { skipped: "no-new" } };
+    }
+    // 增量过短且已有状态时并入最近窗口，保证每次蒸馏有足够上下文；无状态时取全量窗口。
+    const incremental = Boolean(lastHash);
+    const conversation = (incremental && fresh.length < 2 ? parts.slice(-DISTILL_FALLBACK_LOOKBACK) : fresh).join("\n\n").slice(-8000);
+    if (!conversation.trim()) return { content: [{ type: "text", text: "当前会话没有可蒸馏的文本消息。" }], details: { skipped: "no-text" } };
+    const prior = observations(inboxFile()).filter((item) => item.category === "distilled").slice(-20).map((item) => `- ${item.summary}`);
+    const systemPrompt = `你是记忆提炼器。从对话中提取值得长期记忆的候选（已验证事实、决策、约束、失败模式）。规则：1) 每条候选独立、自包含，在未来会话单独成立；2) 只提取可复用的结论，忽略客套、临时操作细节；3) 拒绝提取：文件路径、行数、命令、工具名、目录/文件清单、会话元观察（本对话正在做什么）、执行步骤描述、时间戳；4) 保留原文语言；5) 绝不提取密钥、令牌、密码、私钥、Cookie 或配对码；6) 与"已记录候选"中相同或近似的结论不要重复提取。只输出 JSON：{"facts": ["候选1", "候选2"]}，最多 ${maxItems} 条；没有则 {"facts": []}。`;
+    const userContent = `${prior.length ? `已记录候选（不要重复）:\n${prior.join("\n")}\n\n` : ""}对话片段:\n${conversation}`;
+    let completeFn: ((model: any, context: any, options: any) => Promise<any>) | undefined;
+    try {
+      const compat = await import("@earendil-works/pi-ai/compat");
+      completeFn = (compat as any)?.complete;
+    } catch { /* module unavailable */ }
+    if (typeof completeFn !== "function") return { content: [{ type: "text", text: "蒸馏模块不可用，已跳过；不影响主流程。" }], details: { skipped: "module-unavailable" } };
+    let auth: any;
+    try { auth = await registry.getApiKeyAndHeaders(model); } catch { return { content: [{ type: "text", text: "获取模型凭据失败，蒸馏已跳过。" }], details: { skipped: "auth-failed" } }; }
+    if (!auth?.ok || !auth?.apiKey) return { content: [{ type: "text", text: "未取得模型凭据，蒸馏已跳过。" }], details: { skipped: "no-credentials" } };
+    let response: any;
+    try {
+      response = await completeFn(model, {
+        systemPrompt,
+        messages: [{ role: "user", content: [{ type: "text", text: userContent }], timestamp: Date.now() }],
+      }, { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal, cacheRetention: "none" });
+    } catch { return { content: [{ type: "text", text: "蒸馏调用失败，已跳过；不影响主流程。" }], details: { skipped: "llm-failed" } }; }
+    if (response?.stopReason === "aborted") return { content: [{ type: "text", text: "蒸馏已中止。" }], details: { skipped: "aborted" } };
+    const text = (Array.isArray(response?.content) ? response.content : []).filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text).join("\n").trim();
+    let candidates: string[] = [];
+    try {
+      const parsed = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+      candidates = Array.isArray(parsed?.facts) ? parsed.facts.filter((f: any) => typeof f === "string" && f.trim().length >= 8).map((f: string) => f.trim().slice(0, 200)) : [];
+    } catch { /* unparsable output */ }
+    // LLM 成功（无论是否产出候选）即推进增量位置，避免同一批消息反复蒸馏；失败/中止路径已提前返回。
+    const advanceState = () => withFileMutationQueue(stateFile, () => withLock(stateFile, () => writeAtomically(stateFile, JSON.stringify({ lastHash: fingerprint(msgs[msgs.length - 1].role, msgs[msgs.length - 1].text), updatedAt: timestamp(), sessionId: currentSessionId ?? "" }))));
+    if (!candidates.length) {
+      await advanceState();
+      return { content: [{ type: "text", text: "蒸馏未提取到合格候选（已推进增量位置）。" }], details: { count: 0, incremental } };
+    }
+    let added = 0;
+    for (const candidate of candidates.slice(0, maxItems)) {
+      await appendObservation(inboxFile(), { ts: timestamp(), category: "distilled", summary: candidate });
+      added++;
+    }
+    await advanceState();
+    return { content: [{ type: "text", text: `已写入 ${added} 条蒸馏候选到待审 INBOX；可调用 memory-review 审核后决定是否入库。` }], details: { count: added, incremental } };
+  }
+
   function registerProjectTools(): void {
     if (toolsRegistered) return;
     toolsRegistered = true;
@@ -609,10 +723,16 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
             `> Source: ${params.source.trim()}`,
             `- ${params.fact.trim()}`,
           ].join("\n");
-          const next = `${raw.trimEnd() || "# 稳定事实"}\n\n${entry}\n`;
+          const next = `${raw.trimEnd() || DEFAULT_FACTS_HEADER}\n\n${entry}\n`;
           validateFacts(next);
           writeAtomically(factsFile(), next);
-          return { content: [{ type: "text", text: `已保存 ${id}（${tags.map((tag) => `#${tag}`).join(" ")}）。` }], details: { id, projectKey: location!.projectKey, kind: location!.kind } };
+          // 关联推荐（非自动替代）：保存后扫描活动事实，tags 重叠的旧条目提示可用 replaces 替代——
+          // 推荐由 agent/用户决定，不自动覆盖，防止误替代污染。
+          const related = currentFacts(parseFacts(next)).filter((fact) => fact.id !== id && fact.tags.some((tag) => tags.includes(tag)));
+          const suggestion = related.length
+            ? ` 相关旧事实: ${related.map((fact) => `${fact.id}（${fact.title}）`).join("、")}。若本条是对其更新，请用 replaces=${related[0].id} 重新保存以替代。`
+            : "";
+          return { content: [{ type: "text", text: `已保存 ${id}（${tags.map((tag) => `#${tag}`).join(" ")}）。${suggestion}` }], details: { id, projectKey: location!.projectKey, kind: location!.kind, related: related.map((fact) => fact.id) } };
         }));
       },
     });
@@ -646,57 +766,7 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
       }),
       executionMode: "sequential",
       async execute(_id, params, _signal, _onUpdate, ctx) {
-        requireSessionProject(ctx);
-        const model = (ctx as any)?.model;
-        const registry = (ctx as any)?.modelRegistry;
-        if (!model || !registry || typeof registry.getApiKeyAndHeaders !== "function") {
-          return { content: [{ type: "text", text: "当前会话无可用模型，蒸馏已跳过（候选不会自动成为事实）。" }], details: { skipped: "no-model" } };
-        }
-        const branch = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries?.() ?? [];
-        const parts: string[] = [];
-        for (const entry of [...branch].slice(-20)) {
-          if (entry?.type !== "message") continue;
-          const msg = entry.message;
-          if (!msg || !("role" in msg)) continue;
-          // 只蒸馏 user/assistant 纯文本；跳过 system（记忆注入、指令）与工具消息，避免状态快照/工具输出被当作事实。
-          if (msg.role !== "user" && msg.role !== "assistant") continue;
-          const text = (Array.isArray(msg.content) ? msg.content : []).filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text).join("\n").trim();
-          if (!text) continue;
-          parts.push(`${msg.role === "user" ? "用户" : "助手"}: ${text.slice(0, 1200)}`);
-        }
-        if (!parts.length) return { content: [{ type: "text", text: "当前会话没有可蒸馏的文本消息。" }], details: { skipped: "no-text" } };
-        const conversation = parts.join("\n\n").slice(-8000);
-        let completeFn: ((model: any, context: any, options: any) => Promise<any>) | undefined;
-        try {
-          const compat = await import("@earendil-works/pi-ai/compat");
-          completeFn = (compat as any)?.complete;
-        } catch { /* module unavailable */ }
-        if (typeof completeFn !== "function") return { content: [{ type: "text", text: "蒸馏模块不可用，已跳过；不影响主流程。" }], details: { skipped: "module-unavailable" } };
-        let auth: any;
-        try { auth = await registry.getApiKeyAndHeaders(model); } catch { return { content: [{ type: "text", text: "获取模型凭据失败，蒸馏已跳过。" }], details: { skipped: "auth-failed" } }; }
-        if (!auth?.ok || !auth?.apiKey) return { content: [{ type: "text", text: "未取得模型凭据，蒸馏已跳过。" }], details: { skipped: "no-credentials" } };
-        const systemPrompt = `你是记忆提炼器。从对话中提取值得长期记忆的候选（已验证事实、决策、约束、失败模式）。规则：1) 每条候选独立、自包含，在未来会话单独成立；2) 只提取可复用的结论，忽略客套、临时操作细节；3) 拒绝提取：文件路径、行数、命令、工具名、目录/文件清单、会话元观察（本对话正在做什么）、执行步骤描述、时间戳；4) 保留原文语言；5) 绝不提取密钥、令牌、密码、私钥、Cookie 或配对码。只输出 JSON：{"facts": ["候选1", "候选2"]}，最多 ${params.maxItems ?? 3} 条；没有则 {"facts": []}。`;
-        let response: any;
-        try {
-          response = await completeFn(model, {
-            systemPrompt,
-            messages: [{ role: "user", content: [{ type: "text", text: conversation }], timestamp: Date.now() }],
-          }, { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal: _signal, cacheRetention: "none" });
-        } catch { return { content: [{ type: "text", text: "蒸馏调用失败，已跳过；不影响主流程。" }], details: { skipped: "llm-failed" } }; }
-        if (response?.stopReason === "aborted") return { content: [{ type: "text", text: "蒸馏已中止。" }], details: { skipped: "aborted" } };
-        const text = (Array.isArray(response?.content) ? response.content : []).filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text).join("\n").trim();
-        let candidates: string[] = [];
-        try {
-          const parsed = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
-          candidates = Array.isArray(parsed?.facts) ? parsed.facts.filter((f: any) => typeof f === "string" && f.trim().length >= 8).map((f: string) => f.trim().slice(0, 200)) : [];
-        } catch { /* unparsable output */ }
-        if (!candidates.length) return { content: [{ type: "text", text: "蒸馏未提取到合格候选。" }], details: { count: 0 } };
-        let added = 0;
-        for (const candidate of candidates.slice(0, params.maxItems ?? 3)) {
-          await appendObservation(inboxFile(), { ts: timestamp(), category: "distilled", summary: candidate });
-          added++;
-        }
-        return { content: [{ type: "text", text: `已写入 ${added} 条蒸馏候选到待审 INBOX；可调用 memory-review 审核后决定是否入库。` }], details: { count: added } };
+        return runDistill(ctx, _signal, params.maxItems ?? 2);
       },
     });
   }
@@ -843,12 +913,16 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     location = resolveLocation(ctx.cwd, trustedFor(ctx));
+    currentSessionId = ctx.sessionManager.getSessionId?.();
     delegated = isProjectMemoryGuard(ctx.cwd, pi.getAllTools() as ToolMeta[]);
     registerStatusTool();
     registerGlobalTools();
     if (!delegated) registerProjectTools();
     const hf = handoffFile();
     if (existsSync(hf) && !readHandoffIfFresh()) { try { unlinkSync(hf); } catch { /* stale handoff cleanup */ } }
+  });
+  pi.on("session_shutdown", async () => {
+    injectedKeys.delete(guardKey());
   });
   pi.on("before_agent_start", async (event, ctx) => {
     if (!location || !isSubstantive(event.prompt)) return;
@@ -865,14 +939,25 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     const handoff = readHandoffIfFresh();
     if (handoff && !hasBriefWithHandoff(ctx)) {
       const wrappedHandoff = wrap("project_memory_handoff", handoff, 500);
+      injectedKeys.add(guardKey(ctx.sessionManager.getSessionId?.()));
       return { message: { customType: "project-memory-brief", content: `${content}\n\n${wrappedHandoff}`, display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), schemaVersion: MEMORY_SCHEMA_VERSION, projectKey: location.projectKey, handoff: true } } };
     }
     if (hasBrief(ctx)) return;
+    if (injectedKeys.has(guardKey(ctx.sessionManager.getSessionId?.()))) return;
+    injectedKeys.add(guardKey(ctx.sessionManager.getSessionId?.()));
     return { message: { customType: "project-memory-brief", content, display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), schemaVersion: MEMORY_SCHEMA_VERSION, projectKey: location.projectKey } } };
   });
-  pi.on("session_before_compact", async (event) => {
+  pi.on("session_before_compact", async (event, ctx) => {
     if (!location || delegated) return;
     try {
+      // 压缩前自动蒸馏（借鉴 OptMem nap）：把新增对话提炼为 INBOX 候选再压缩，候选仍由 review 审核；
+      // 无模型/失败时安全跳过，绝不阻塞压缩。
+      await runDistill(ctx, undefined, 2);
+    } catch { /* Distill never interrupts compaction. */ }
+    try {
+      // compaction 会把分支中较早的 custom_message 压缩掉；清除进程级锁，
+      // 允许压缩后的第一轮重新注入一次精简 brief 以恢复跨会话背景。
+      injectedKeys.delete(guardKey());
       const reason = event.reason ?? "compact";
       const content = buildHandoff(reason);
       writeAtomically(handoffFile(), `<!-- HANDOFF ${timestamp()} [compact:${reason}] -->\n${content}`);
