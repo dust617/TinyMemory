@@ -1,71 +1,104 @@
-# TinyMemory v0.14
+# TinyMemory v0.15.0
 
-轻量、防泄密、跨会话的记忆守卫（memory guard）系统，为 AI 编码代理（pi-coding-agent 扩展生态）提供有界、可审计、可校验的项目记忆。
+TinyMemory 是一个面向 AI 编码代理的轻量、跨会话、默认去敏的记忆守卫。它以 pi-coding-agent 扩展形式运行，并提供有界存储、渐进式召回、秘密过滤、校验和任务归档工具。
 
 ## 设计目标
 
-- **跨 session 连续**：会话中断/模型切换/compaction 后仍能恢复项目状态。
-- **容量有界**：活动层永远小（STATUS/FACTS 有硬上限），超限失败关闭并要求归档，不做"无限自动记忆"。
-- **无秘密值**：记忆层只存符号引用与"待轮换"状态；写入/读取/校验三层扫描秘密模式，命中即拒绝或停止输出。
-- **可审计**：FACTS 条目带 Source / Verified / TTL / Replaces，校验器检查全部约束。
+- **跨 session 连续**：会话中断、模型切换或 compaction 后仍可恢复项目状态。
+- **严格作用域**：项目事实默认隔离；全局偏好和跨项目关联使用独立、显式的数据层。
+- **容量有界**：活动层设硬上限，超限时失败关闭，不创建无限增长的“自动记忆”。
+- **默认去敏**：保存、召回、注入和校验均扫描秘密模式；命中时拒绝写入或停止输出。
+- **可审计**：事实带 `Source`、`Verified`、`TTL`、`Replaces` 元数据，候选进入 INBOX 后再人工确认。
 
-## v0.14 新增（借鉴 OptMem）
+## v0.15 新增
 
-- **增量蒸馏**：`memory-distill` 只提炼自上次以来的新消息（`DISTILL_STATE.json` 记录消息指纹），并附"已记录候选"防止重复结论；无状态/被压缩时回退全量窗口。
-- **压缩前自动蒸馏**：`session_before_compact` 自动触发一次蒸馏（失败安全，不阻塞压缩），候选仍由 `memory-review` 审核后才入库。
-- **INBOX 超龄自动降级**：蒸馏候选超过 30 天未审核自动丢弃（时间维度 + 容量上限双重修剪）。
-- **保存时关联推荐**：`memory-save` 写入后自动扫描 tags 重叠的活动旧事实，提示可用 `replaces` 替代；**不自动覆盖**，替代决定由 agent/用户确认。
-- **Brief 时间衰减**：注入时优先展示 ≤14 天验证的事实（pinned 最前、不足补旧），`memory-recall` 保持精确召回不受影响。
-- **蒸馏候选跨分钟查重**：同一结论反复提炼会被 INBOX 去重拦截。
-- **UNVERIFIED 标记**：过期且未复核的事实可标记 `Status: UNVERIFIED`，校验器降级为 warning 而非阻塞（标记后仍应尽快复核）。
-- **子代理硬规则**：子代理不调用主项目记忆工具，写入仅由主会话代理判断后执行。
+- **L2/L3 项目画像**：`memory-profile` 管理稳定拓扑、关键路径和约定；Brief 优先注入画像，再按需下钻事实。
+- **三层作用域**：项目 STATUS/FACTS 严格隔离；用户确认的协作偏好可全局使用；项目关联只保存带 TTL 的最小摘要。
+- **混合召回**：`memory-recall` 支持 FTS5、标签和关键词融合排序，并用 `maxChars` 控制输出预算。
+- **聚焦输出**：带 query/tags 的 recall 不重复 STATUS，过期提醒只针对本次命中事实；召回保持只读，不刷新 Verified/TTL。
+- **多会话安全**：异步状态按 `sessionId + projectKey` 双键隔离，并在工具与事件入口复核 cwd。
+- **注入降噪**：无标签 Brief 不再注入任意最新事实；handoff 不重复 STATUS/FACTS；同一 session 自动去重。
+- **委托兼容**：全局扩展与项目级扩展可按明确来源安全委托，避免重复注册或错误关闭。
 
-## 核心组成
+## 工具
 
-| 文件 | 作用 |
+| 工具 | 作用 |
 |---|---|
-| `index.ts` | pi-coding-agent 扩展：自动注入有界 Brief、`memory-recall/save/review/status/distill` 等工具路由、观察事件（tool_failure / config_change / distilled）入 INBOX、压缩前自动蒸馏、保存时关联推荐 |
-| `contract.ts` | 扩展侧事实契约：秘密模式、TTL 计算、风险检测（与 CLI 侧同一 schema 事实源） |
-| `scripts/memory-contract.mjs` | CLI 侧契约：INBOX 分类白名单、秘密模式、边界常量（扩展与 CLI 必须保持同步，由测试断言） |
-| `scripts/check-memory.mjs` | 项目记忆全量校验器（`npm run memory:check`）：字节/行上限、TTL、Fact ID/Replaces、遗留 KEYSTORE、秘密模式、归档总量、UNVERIFIED 豁免 |
-| `scripts/archive-memory-task.mjs` | 完成任务归档（`npm run memory:archive -- <slug>`）：校验 → 复制到 `archive/tasks/YYYY-MM-DD-<slug>/` → SHA-256 manifest → 重置 |
-| `tests/memory-guard.test.mjs` | 端到端测试（`npm test`）：注入、召回、保存、安全拒绝、并发写入、同步闸门 |
+| `memory-status` | 更新当前项目的短期状态与最多 6 个下一步 |
+| `memory-profile` | 更新稳定项目画像 |
+| `memory-recall` | 按 tags/query 召回项目事实 |
+| `memory-save` | 保存已验证事实、决策、约束或失败模式 |
+| `memory-review` | 查看低噪声候选观察 |
+| `memory-distill` | 从近期会话提取候选，写入 INBOX 而非直接成为事实 |
+| `memory-preference-*` | 管理经用户确认的全局协作偏好 |
+| `memory-link-*` | 管理经用户确认的最小跨项目关联摘要 |
 
-## 三层作用域
+## 数据层
 
-1. **项目层**：`.pi/memory/`（STATUS.md / FACTS.md / INBOX.jsonl）——严格按项目根路径隔离。
-2. **全局偏好层**：仅限用户明确确认的协作偏好（语言、输出风格、工作流、确认习惯）。
-3. **项目关联层**：带 TTL 的最小跨项目摘要，绝不透传其他项目事实或凭据。
+### 项目层
 
-## 文件布局与硬限制（使用方项目）
-
-| 文件 | 作用 | 硬限制 |
+| 文件 | 作用 | 默认硬限制 |
 |---|---|---:|
-| `.pi/memory/STATUS.md` | 当前状态与最多 6 个下一步 | 2 KiB / 32 行 |
-| `.pi/memory/FACTS.md` | 稳定事实、决策、约束、失败模式 | 64 KiB / 800 行（约 100 条） |
-| `.pi/memory/INBOX.jsonl` | 观察候选（需人工 review 后入 FACTS） | audit 保留 40 条 / distilled 保留 60 条，超 30 天未审核自动降级 |
-| `.pi/memory/DISTILL_STATE.json` | 蒸馏增量位置（消息指纹） | ~1 KiB，覆写 |
+| `.pi/memory/STATUS.md` | 当前状态与下一步 | 2 KiB / 32 行 |
+| `.pi/memory/PROJECT.md` | 稳定项目画像 | 4 KiB / 48 行 |
+| `.pi/memory/FACTS.md` | 稳定事实、决策、约束、失败模式 | 64 KiB / 800 行 |
+| `.pi/memory/INBOX.jsonl` | 审计观察和蒸馏候选 | 100 条 |
+| `.pi/memory/DISTILL_STATE.json` | 增量蒸馏位置 | 约 1 KiB |
 
-校验失败时禁止继续归档或删除 session；当前事实只允许一个活动版本，冲突先复验再替代。
+### 全局层
 
-## 安装与使用
+- **偏好**仅允许语言、输出风格、工作流和审批习惯，且必须由用户确认。
+- **项目关联**仅保存不超过 360 字、带 TTL 的最小摘要；不会复制另一项目的 STATUS 或 FACTS。
+- 未配置项目级存储时，全局扩展会按规范化项目根路径哈希隔离数据。
 
-### 作为 pi 扩展
+## 安装
 
-把 `index.ts` + `contract.ts` 放入 `~/.pi/agent/extensions/memory-guard/`（全局）或 `<project>/.pi/extensions/memory-guard/`（项目级）。首次实质请求自动注入 Brief；修改后 `/reload` 或开新 session 生效。
+要求 Node.js 22.5+，运行时依赖由 pi-coding-agent 宿主提供。
 
-### 校验
+### 全局扩展
 
 ```bash
-npm install          # 仅测试所需（jiti/typebox 等；运行时由 pi 宿主提供）
-npm test             # 扩展侧端到端测试
-npm run memory:check # 校验当前项目的记忆文件
-npm run memory:archive -- <slug>  # 完成任务归档
+mkdir -p ~/.pi/agent/extensions/memory-guard
+cp index.ts contract.ts ~/.pi/agent/extensions/memory-guard/
 ```
+
+### 项目级扩展
+
+```bash
+mkdir -p .pi/extensions/memory-guard
+cp index.ts contract.ts .pi/extensions/memory-guard/
+```
+
+修改扩展后执行 `/reload` 或开启新 session。
+
+## 校验与测试
+
+```bash
+npm install --include=dev
+npm test
+npm run memory:check
+npm run memory:archive -- <slug>
+```
+
+- `npm test` 覆盖注入、召回、作用域隔离、保存拒绝、并发写入、蒸馏、FTS、委托和契约同步。
+- `memory:check` 校验容量、TTL、Fact ID/Replaces、秘密模式、临时文件和归档上限。
+- `memory:archive` 执行“校验 → 原子归档 → SHA-256 manifest → 重置当前任务文件”。
+
+## 隐私与发布边界
+
+不要提交以下运行数据：
+
+- `.pi/memory/`
+- `archive/`
+- `session-exports/`
+- session/chat transcript（例如 `*.jsonl`）
+- `.env*`、Cookie、Token、私钥、认证 URL 或配对码
+
+仓库只应包含通用源码、测试夹具和文档。测试中出现的 `example.com`、固定 UUID 或假 Token 仅用于验证秘密过滤器，不代表真实凭据。
 
 ## 秘密过滤
 
-统一模式源（`contract.ts` 与 `scripts/memory-contract.mjs` 一致）覆盖：私钥、API token（sk-/ghp_/github_pat 等）、VLESS URL、凭据 UUID、六位配对码、authorization/bearer/cookie 头、`key=value` 凭据赋值、URL 内嵌凭据。`npm test` 的同步闸门默认断言两侧一致（可通过 `PI_MEMORY_CONTRACT=scripts/memory-contract.mjs` 显式启用）。
+`contract.ts` 与 `scripts/memory-contract.mjs` 使用同步契约，覆盖私钥、常见 API Token、VLESS URL、凭据 UUID、六位配对码、Authorization/Bearer/Cookie 头、凭据赋值和 URL 内嵌凭据。测试包含契约同步闸门，避免扩展侧与 CLI 侧规则漂移。
 
 ## 许可证
 

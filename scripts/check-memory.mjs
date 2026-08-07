@@ -14,6 +14,7 @@ const specs = [
   ['AGENTS.md', 8192, 160, true],
   ['.pi/memory/STATUS.md', 2048, 32, true],
   ['.pi/memory/FACTS.md', 65536, 800, true],
+  ['.pi/memory/PROJECT.md', 4096, 48, true],
   ['task_plan.md', 4096, 80, true],
   ['findings.md', 24576, 320, true],
   ['progress.md', 8192, 120, true],

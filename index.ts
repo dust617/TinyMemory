@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -31,7 +32,7 @@ type Fact = {
   body: string;
 };
 type ToolMeta = { name: string; sourceInfo?: { path?: string; baseDir?: string; source?: string; scope?: string } };
-function isProjectMemoryGuard(cwd: string, tools: ToolMeta[]): boolean {
+function isProjectMemoryGuard(cwd: string, tools: ToolMeta[], allowNoInfoFallback = true): boolean {
   const recall = tools.find((t) => t.name === "memory-recall");
   const save = tools.find((t) => t.name === "memory-save");
   const review = tools.find((t) => t.name === "memory-review");
@@ -49,7 +50,7 @@ function isProjectMemoryGuard(cwd: string, tools: ToolMeta[]): boolean {
   if (allPath) return true;
   // Fallback: if sourceInfo is entirely absent for all three, trust the complete trio.
   const noInfo = !recall.sourceInfo && !save.sourceInfo && !review.sourceInfo;
-  return noInfo;
+  return allowNoInfoFallback && noInfo;
 }
 
 type Location = { projectRoot: string; projectKey: string; memoryDir: string; kind: "project" | "central" };
@@ -214,6 +215,7 @@ function initializeLocation(location: Location): void {
   const statusFile = join(location.memoryDir, "STATUS.md");
   const factsFile = join(location.memoryDir, "FACTS.md");
   const inboxFile = join(location.memoryDir, "INBOX.jsonl");
+  const profileFile = join(location.memoryDir, "PROJECT.md");
   if (!existsSync(statusFile)) {
     writeAtomically(statusFile, [
       "# STATUS",
@@ -228,6 +230,7 @@ function initializeLocation(location: Location): void {
   }
   if (!existsSync(factsFile)) writeAtomically(factsFile, "# 稳定事实\n");
   if (!existsSync(inboxFile)) writeAtomically(inboxFile, "");
+  if (!existsSync(profileFile)) writeAtomically(profileFile, `${DEFAULT_PROFILE_HEADER}\n`);
 }
 function isProcessRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (error: any) { return error?.code !== "ESRCH"; }
@@ -296,28 +299,118 @@ function currentFacts(facts: Fact[]): Fact[] {
   return facts.filter((fact) => !superseded.has(fact.id));
 }
 function activeFacts(facts: Fact[]): Fact[] { return currentFacts(facts).filter((fact) => !isExpired(fact.verified, fact.ttlDays)); }
-function reinforceVerified(raw: string, ids: string[]): string {
-  const target = new Set(ids);
-  let current: string | null = null;
-  return raw.split("\n").map((line) => {
-    const heading = line.match(/^## (F-\d+) \|/);
-    if (heading) { current = heading[1]; return line; }
-    if (current && target.has(current)) {
-      const verified = line.match(/^> Verified: (\d{4}-\d{2}-\d{2}) \| TTL: (\d+)d$/);
-      if (verified) return `> Verified: ${today()} | TTL: ${verified[2]}d`;
-    }
-    return line;
-  }).join("\n");
-}
-function expiringCount(raw: string): number {
-  return activeFacts(parseFacts(raw)).filter((fact) => {
-    const remaining = fact.ttlDays - calendarAgeDays(fact.verified);
-    return remaining <= Math.max(1, Math.ceil(fact.ttlDays * 0.2));
-  }).length;
+function isExpiringFact(fact: Fact): boolean {
+  const remaining = fact.ttlDays - calendarAgeDays(fact.verified);
+  return remaining <= Math.max(1, Math.ceil(fact.ttlDays * 0.2));
 }
 function renderFact(fact: Fact, maxChars = MAX_FACT_CHARS): string {
   const meta = [`类型: ${fact.type}`, `验证: ${fact.verified}`, fact.source ? `来源: ${fact.source}` : ""].filter(Boolean).join(" | ");
   return compact(`- [${fact.id}] ${fact.title} (#${fact.tags.join(" #")})\n  ${meta}\n  ${fact.body}`, maxChars);
+}
+function profileBrief(profile: string, maxChars: number): string {
+  const body = String(profile ?? "").replace(/^# 项目画像\s*\n/, "").replace(/^<!--[\s\S]*?-->\s*/m, "").trim();
+  return body ? compact(body, maxChars) : "";
+}
+function tokenizeWords(text: string): string[] {
+  return String(text ?? "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+function queryTerms(query: string): string[] {
+  const terms = new Set<string>();
+  for (const token of tokenizeWords(query)) {
+    const chars = [...token];
+    const hasCjk = chars.some((char) => /\p{Script=Han}/u.test(char));
+    if (!hasCjk) {
+      if (chars.length >= 2) terms.add(token);
+      continue;
+    }
+    // FTS5 trigram works best with short overlapping CJK phrases. Keep a
+    // 2-character term for the non-SQLite substring fallback as well.
+    if (chars.length <= 3) terms.add(token);
+    else for (let index = 0; index <= chars.length - 3; index += 1) terms.add(chars.slice(index, index + 3).join(""));
+  }
+  return [...terms];
+}
+function jaccard(a: string[], b: string[]): number {
+  if (!a.length || !b.length) return 0;
+  const sa = new Set(a), sb = new Set(b);
+  let inter = 0; for (const t of sa) if (sb.has(t)) inter++;
+  const union = sa.size + sb.size - inter;
+  return union ? inter / union : 0;
+}
+async function ftsScores(facts: Fact[], query: string): Promise<{ ranked: string[]; strict: Set<string>; available: boolean }> {
+  const terms = queryTerms(query);
+  if (!terms.length) return { ranked: [], strict: new Set(), available: true };
+  // OR fallback must still cover most of a multi-term query. Without this gate,
+  // generic words such as "memory" or "match" can turn an otherwise unknown
+  // diagnostic query into a plausible-looking but unrelated fact.
+  const requiredMatches = terms.length === 1 ? 1 : Math.max(2, Math.ceil(terms.length * 0.6));
+  const matchCounts = new Map(facts.map((fact) => {
+    const documentTerms = new Set(queryTerms(`${fact.title} ${fact.tags.join(" ")} ${fact.body}`));
+    return [fact.id, terms.filter((term) => documentTerms.has(term)).length] as const;
+  }));
+  const fallback = () => {
+    const ranked = facts.map((fact) => ({ id: fact.id, matches: matchCounts.get(fact.id) ?? 0 }))
+      .filter((item) => item.matches >= requiredMatches).sort((a, b) => b.matches - a.matches);
+    return { ranked: ranked.map((item) => item.id), strict: new Set(ranked.filter((item) => item.matches === terms.length).map((item) => item.id)), available: false };
+  };
+  // Trigram indexes cannot reliably answer a 2-character term; retain exact
+  // substring semantics for such queries instead of silently returning nothing.
+  if (terms.some((term) => [...term].length < 3)) return fallback();
+  let db: any = null;
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    db = new DatabaseSync(":memory:");
+    db.exec("CREATE VIRTUAL TABLE facts USING fts5(id UNINDEXED, text, tokenize='trigram')");
+    const ins = db.prepare("INSERT INTO facts(id, text) VALUES (?, ?)");
+    for (const fact of facts) ins.run(fact.id, `${fact.title} ${fact.tags.join(" ")} ${fact.body}`);
+    const quoted = terms.map((term) => `"${term.replace(/"/g, "\"\"")}"`);
+    const find = (matchExpr: string) => db.prepare("SELECT id FROM facts WHERE facts MATCH ? ORDER BY bm25(facts, 10.0, 5.0) LIMIT 50").all(matchExpr).map((row: any) => String(row.id));
+    const strict = quoted.length > 1 ? find(quoted.join(" AND ")) : find(quoted[0]);
+    const loose = (quoted.length > 1 ? find(quoted.join(" OR ")) : strict)
+      .filter((id: string) => (matchCounts.get(id) ?? 0) >= requiredMatches);
+    return { ranked: [...strict, ...loose.filter((id: string) => !strict.includes(id))], strict: new Set(strict), available: true };
+  } catch { return fallback(); }
+  finally { try { db?.close?.(); } catch { /* ignore */ } }
+}
+// 混合召回：标签和关键词分别 RRF；query 无命中时不再把全部事实当作候选，支持可靠弃答。
+async function hybridRecall(allActivity: Fact[], query: string, tags: string[], limit: number): Promise<{ facts: Fact[]; channels: Record<string, string[]>; keywordAvailable: boolean }> {
+  const score = new Map<string, number>();
+  const channels = new Map<string, Set<string>>();
+  const addRank = (ordered: string[], channel: string) => ordered.forEach((id, index) => {
+    score.set(id, (score.get(id) ?? 0) + 1 / (RRF_K + index + 1));
+    const values = channels.get(id) ?? new Set<string>(); values.add(channel); channels.set(id, values);
+  });
+  const expanded = expandTags(tags);
+  if (expanded.length) {
+    const tagged = allActivity.filter((fact) => fact.tags.some((tag) => expanded.includes(tag)))
+      .sort((a, b) => a.priority !== b.priority ? (a.priority === "pinned" ? -1 : 1) : b.verified.localeCompare(a.verified));
+    addRank(tagged.map((fact) => fact.id), "tag");
+  }
+  const keyword = await ftsScores(allActivity, query);
+  addRank(keyword.ranked, "keyword");
+  for (const id of keyword.strict) channels.get(id)?.add("keyword-all");
+  const byId = new Map(allActivity.map((fact) => [fact.id, fact]));
+  const ranked = [...score.entries()].sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    const fa = byId.get(a[0]), fb = byId.get(b[0]);
+    if (!fa || !fb) return 0;
+    return fa.priority !== fb.priority ? (fa.priority === "pinned" ? -1 : 1) : fb.verified.localeCompare(fa.verified);
+  }).slice(0, limit).map(([id]) => id);
+  return { facts: ranked.map((id) => byId.get(id)!).filter(Boolean), channels: Object.fromEntries(ranked.map((id) => [id, [...(channels.get(id) ?? [])]])), keywordAvailable: keyword.available };
+}
+// 召回总量护栏：把多事实输出裁剪到总字符预算内，并暴露是否因预算截断。
+function renderFactsWithinBudget(facts: Fact[], maxChars: number): { text: string; truncated: boolean } {
+  const parts: string[] = [];
+  let used = 0;
+  for (const fact of facts) {
+    const line = renderFact(fact);
+    if (used + line.length > maxChars) {
+      if (!parts.length) return { text: compact(line, maxChars), truncated: true };
+      return { text: parts.join("\n\n"), truncated: true };
+    }
+    parts.push(line); used += line.length;
+  }
+  return { text: parts.join("\n\n"), truncated: false };
 }
 function section(markdown: string, heading: string): string {
   return markdown.match(new RegExp(`^## ${heading}\\s*\\n([\\s\\S]*?)(?=^## |$)`, "m"))?.[1]?.trim() ?? "";
@@ -375,11 +468,24 @@ const DISTILL_BRANCH_LOOKBACK = 40; // 蒸馏扫描的最近消息数（增量�
 const DISTILL_FALLBACK_LOOKBACK = 20; // 无增量状态/增量过短时回退的全量窗口（保持原行为）
 const DISTILL_RECENT_FACTS_DAYS = 14; // Brief 时间衰减窗口：近期验证的事实优先展示
 const DISTILL_CANDIDATE_MAX_AGE_DAYS = 30; // INBOX 蒸馏候选超龄自动降级：超过 N 天未审核视为无价值丢弃
+// 主动蒸馏（opt-in，借鉴 TAM everyNConversations）：设 PI_MEMORY_AUTO_DISTILL_TURNS=N（>0）时，
+// 每 N 个实质轮次在 turn_end 触发一次轻量蒸馏；默认 0 = 关闭，行为与现行一致。
+// 触发为 fire-and-forget 且全额错误隔离，绝不阻塞主流程或中断会话。
+const AUTO_DISTILL_TURNS = Number(process.env.PI_MEMORY_AUTO_DISTILL_TURNS ?? "0");
 // FACTS 为提炼层：条目源自对话/事件的稳定结论，原始蒸馏候选留存于 INBOX.jsonl（distilled 类目），
 // 可用 Source 溯源；坏条目用 Replaces 更新（借鉴 OptMem"摘要可重建"：日志保留原始，提炼层可重算）。
 const DEFAULT_FACTS_HEADER = `# 稳定事实
 
 <!-- 提炼层：条目为从对话/事件提炼的稳定结论；原始蒸馏候选留存于 INBOX.jsonl（distilled 类目），可用 Source 溯源。条目过期须复验或用 Replaces 更新，禁止双真相并存。 -->`;
+// L2/L3 项目画像层（借鉴 TAM L0-L3 渐进分层：L0 archive 原始证据 / L1 FACTS 原子事实 / L2 PROJECT 稳定拓扑与场景 / L3 偏好画像）。
+// 顶层画像 compact 随 Brief 注入，按需才下钻 L1 事实；L0 走 archive。易变细节写 STATUS，原子结论写 FACTS，凭据不入记忆。
+const MAX_PROFILE_BYTES = 4096;
+const DEFAULT_PROFILE_HEADER = `# 项目画像
+
+<!-- L2/L3 层：仅记录跨会话稳定、可复用的项目拓扑/关键路径/约定；易变细节写 STATUS，原子结论写 FACTS，凭据不入记忆。 -->`;
+// FTS5 关键词召回（借鉴 TAM hybrid RRF）：node:sqlite trigram + BM25，与标签召回 RRF 融合；索引或 node:sqlite 不可用时安全回退。
+const RECALL_DEFAULT_MAX_CHARS = 2400; // memory-recall 聚合输出预算（借鉴 TAM maxTotalRecallChars）
+const RRF_K = 60;
 function observations(file: string): Observation[] {
   // 全量读取（分层后上限 100 行），不再截断最近 20 条——避免旧候选成为不可见僵尸数据。
   return readText(file).split(/\r?\n/).filter(Boolean).flatMap((line) => { try { const value = JSON.parse(line) as Observation; return value.summary ? [value] : []; } catch { return []; } });
@@ -408,33 +514,82 @@ async function appendObservation(file: string, item: Observation): Promise<void>
 }
 
 export default function globalMemoryGuard(pi: ExtensionAPI) {
-  let location: Location | undefined;
-  let delegated = false;
+  type SessionState = { location: Location; delegated: boolean; sessionId?: string; autoDistillTurns: number };
+  const sessions = new Map<string, SessionState>();
+  const activeSession = new AsyncLocalStorage<SessionState>();
+  // The proxy keeps helper call sites concise while AsyncLocalStorage binds every
+  // async handler/tool chain to its own state. A single extension instance serves
+  // multiple pi-web sessions, so module-level mutable session state is unsafe.
+  const location = new Proxy({} as Location, {
+    get(_target, property) {
+      const value = activeSession.getStore()?.location;
+      if (!value) throw new Error("项目记忆尚未绑定到当前会话。");
+      return Reflect.get(value, property);
+    },
+  });
   let toolsRegistered = false;
+  let projectToolsOwned = false;
   let statusToolRegistered = false;
   let globalToolsRegistered = false;
-  // 进程级注入去重（按会话）：分支扫描失效（getSessionId 短暂不可用、中止/重连、扩展重载）时
-  // 也能保证同一会话在本次进程内不重复注入 brief；session_before_compact 清除一次，
-  // 允许 compaction 后按需补一次以恢复被压缩掉的跨会话背景。
-  // 注意：pi-web 单进程多会话，锁必须按 sessionId 区分，否则同项目第二个会话会拿不到 brief。
+  // 进程级注入去重按 project+session 保存；压缩后仅清除对应会话的键。
   const injectedKeys = new Set<string>();
-  let currentSessionId: string | undefined;
-  const guardKey = (sessionId?: string) => `${location?.projectKey ?? "?"}:${sessionId ?? currentSessionId ?? "?"}`;
-
-  const statusFile = () => join(location!.memoryDir, "STATUS.md");
-  const factsFile = () => join(location!.memoryDir, "FACTS.md");
-  const inboxFile = () => join(location!.memoryDir, "INBOX.jsonl");
-  const handoffFile = () => join(location!.memoryDir, "HANDOFF.md");
   function trustedFor(ctx: any): boolean { return typeof ctx?.isProjectTrusted === "function" ? Boolean(ctx.isProjectTrusted()) : false; }
-  function matchesSessionProject(ctx: any): boolean {
-    if (!location || typeof ctx?.cwd !== "string") return Boolean(location);
+  function sessionKey(ctx: any): string {
+    const project = resolveLocation(ctx?.cwd ?? process.cwd(), trustedFor(ctx));
+    const sessionId = ctx?.sessionManager?.getSessionId?.();
+    if (typeof sessionId === "string" && sessionId) return `session:${sessionId}:${project.projectKey}`;
+    return `anonymous:${project.projectKey}`;
+  }
+  function hasConflictingKnownProject(ctx: any): SessionState | undefined {
+    if (!ctx?.cwd) return undefined;
     const current = resolveLocation(ctx.cwd, trustedFor(ctx));
-    return current.projectKey === location.projectKey && pathKey(current.projectRoot) === pathKey(location.projectRoot);
+    return [...sessions.values()].find((state) => state.location.projectKey !== current.projectKey || pathKey(state.location.projectRoot) !== pathKey(current.projectRoot));
+  }
+  function activateSession(ctx: any, refresh = false): SessionState {
+    // Pi tool callbacks normally provide ctx. Older callers without it are only
+    // accepted when exactly one session is known; otherwise fail closed rather
+    // than attributing a memory operation to the most recently active project.
+    if (!ctx) {
+      const only = sessions.size === 1 ? sessions.values().next().value as SessionState | undefined : undefined;
+      if (!only) throw new Error("项目记忆操作缺少会话上下文，已拒绝以防跨项目写入。");
+      activeSession.enterWith(only);
+      return only;
+    }
+    const key = sessionKey(ctx);
+    let state = sessions.get(key);
+    if (!state && !refresh && hasConflictingKnownProject(ctx)) throw new Error("检测到当前工作目录已切换到另一项目；请先触发 session_start，已拒绝读写旧项目记忆。");
+    if (!state || refresh) {
+      state = {
+        location: resolveLocation(ctx.cwd, trustedFor(ctx)),
+        // Once this extension owns the no-sourceInfo trio, disable only that
+        // ambiguous fallback. A later project extension with explicit sourceInfo
+        // must still win and receive delegation in the same process.
+        delegated: isProjectMemoryGuard(ctx.cwd, pi.getAllTools() as ToolMeta[], !projectToolsOwned),
+        sessionId: ctx?.sessionManager?.getSessionId?.(),
+        autoDistillTurns: 0,
+      };
+      sessions.set(key, state);
+    }
+    activeSession.enterWith(state);
+    return state;
+  }
+  function currentState(): SessionState | undefined { return activeSession.getStore(); }
+  const guardKey = (sessionId?: string) => `${currentState()?.location.projectKey ?? "?"}:${sessionId ?? currentState()?.sessionId ?? "?"}`;
+
+  const statusFile = () => join(location.memoryDir, "STATUS.md");
+  const factsFile = () => join(location.memoryDir, "FACTS.md");
+  const inboxFile = () => join(location.memoryDir, "INBOX.jsonl");
+  const handoffFile = () => join(location.memoryDir, "HANDOFF.md");
+  function matchesSessionProject(ctx: any): boolean {
+    const state = activateSession(ctx);
+    if (typeof ctx?.cwd !== "string") return true;
+    const current = resolveLocation(ctx.cwd, trustedFor(ctx));
+    return current.projectKey === state.location.projectKey && pathKey(current.projectRoot) === pathKey(state.location.projectRoot);
   }
   function requireSessionProject(ctx: any): Location {
-    if (!location) throw new Error("项目记忆尚未初始化。");
+    const state = activateSession(ctx);
     if (!matchesSessionProject(ctx)) throw new Error("检测到当前工作目录已切换到另一项目；为防止混淆，已拒绝读写旧项目记忆。请新建会话后继续。");
-    return location;
+    return state.location;
   }
   function hasCustomMessage(ctx: any, customType: string): boolean {
     const id = ctx.sessionManager.getSessionId?.();
@@ -444,8 +599,9 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     return entries.some((entry: any) => entry.type === "custom_message" && entry.customType === customType && (!id || entry.details?.sessionId === id));
   }
   function applicableLinks(): ProjectLink[] {
-    if (!location) return [];
-    return projectLinks().filter((link) => link.fromProjectKey === location!.projectKey || (link.direction === "two-way" && link.toProjectKey === location!.projectKey));
+    const state = currentState();
+    if (!state) return [];
+    return projectLinks().filter((link) => link.fromProjectKey === state.location.projectKey || (link.direction === "two-way" && link.toProjectKey === state.location.projectKey));
   }
   function buildGlobalPreferencesBrief(): string | null {
     const preferences = globalPreferences().sort((a, b) => a.priority !== b.priority ? (a.priority === "pinned" ? -1 : 1) : b.verified.localeCompare(a.verified)).slice(0, 3);
@@ -457,12 +613,14 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     ].join("\n");
     return wrap("global_preferences", body, 680);
   }
-  function safeReadSet(): { status: string; facts: string; risk: string | null } {
+  function safeReadSet(): { status: string; facts: string; profile: string; risk: string | null } {
     const status = readText(statusFile());
     const facts = readText(factsFile());
+    const profile = readText(join(location!.memoryDir, "PROJECT.md"));
     const statusRisk = findContentRisk(status);
     const factsRisk = findContentRisk(facts);
-    return { status, facts, risk: statusRisk ? `STATUS.md: ${statusRisk}` : factsRisk ? `FACTS.md: ${factsRisk}` : null };
+    const profileRisk = findContentRisk(profile);
+    return { status, facts, profile, risk: statusRisk ? `STATUS.md: ${statusRisk}` : factsRisk ? `FACTS.md: ${factsRisk}` : profileRisk ? `PROJECT.md: ${profileRisk}` : null };
   }
   function selectFacts(tags: string[] = [], limit = MAX_RECALL_FACTS, raw = readText(factsFile()), recentDays = 0): Fact[] {
     const expanded = expandTags(tags);
@@ -482,14 +640,20 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     const read = safeReadSet();
     if (read.risk) return wrap("project_memory_brief", `⚠ 已阻止加载项目记忆：检测到 ${read.risk}。`, MAX_BRIEF_CHARS);
     const tags = deriveTags(prompt);
-    const facts = selectFacts(tags, tags.length ? 2 : 1, read.facts, DISTILL_RECENT_FACTS_DAYS);
+    const facts = tags.length
+      ? selectFacts(tags, 2, read.facts, DISTILL_RECENT_FACTS_DAYS)
+      : selectFacts([], 1, read.facts, DISTILL_RECENT_FACTS_DAYS).filter((fact) => fact.priority === "pinned");
     const links = applicableLinks();
-    const expiring = expiringCount(read.facts);
+    const expiring = facts.filter(isExpiringFact).length;
     // 精简版：只保留事实与最小边界说明，去掉与 AGENTS.md/工具描述重复的元指令，
     // 避免占满 760 字符上限导致截断出半截警告，也降低上下文顶部负担。
+    const profile = read.profile;
+    const profileLine = profile ? `项目画像:\n${profileBrief(profile, tags.length ? 200 : 300)}` : "";
+    // 精简版：L2/L3 画像在最上（渐进披露顶层），下钻才到 STATUS 与事实；去掉与 AGENTS.md/工具描述重复的元指令。
     const body = [
       `当前项目（${projectLabel(location!.projectRoot)} / ${location!.projectKey}）跨会话背景：仅适用于本项目，勿外推到其他项目；凭据不进入记忆。`,
-      `当前状态:\n${statusBrief(read.status, tags.length ? 240 : 320)}`,
+      profileLine,
+      `当前状态:\n${statusBrief(read.status, tags.length ? (profileLine ? 180 : 240) : (profileLine ? 240 : 320))}`,
       facts.length ? `相关事实:\n${facts.map((fact) => renderFact(fact, 160)).join("\n")}` : "",
       expiring ? `⚠ ${expiring} 条事实即将到期（≤20% TTL）；先复核再引用。` : "",
       links.length ? `项目关联 ${links.length} 条；按需 memory-link-recall 读取最小摘要。` : "",
@@ -497,13 +661,12 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     return wrap("project_memory_brief", body, MAX_BRIEF_CHARS);
   }
   function buildHandoff(reason: string): string {
-    const read = safeReadSet();
-    const pinned = selectFacts([], 2, read.facts).filter((f) => f.priority === "pinned");
+    // PROJECT/STATUS/FACTS are already represented by the normal project brief.
+    // Handoff carries only ephemeral compression context to avoid injecting the
+    // same status and facts twice in a fresh or post-compaction session.
     const obs = observations(inboxFile()).slice(-3);
     const body = [
       `压缩交接 (reason: ${reason})`,
-      `当前状态:\n${statusBrief(read.status, 300)}`,
-      pinned.length ? `关键事实:\n${pinned.map((f) => renderFact(f, 150)).join("\n")}` : "",
       obs.length ? `近期观察:\n${obs.map((o) => `- ${o.category}: ${o.summary}`).join("\n")}` : "",
     ].filter(Boolean).join("\n\n");
     // Disk state must stay data-only. Wrap only when injecting into a session;
@@ -633,7 +796,7 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
       candidates = Array.isArray(parsed?.facts) ? parsed.facts.filter((f: any) => typeof f === "string" && f.trim().length >= 8).map((f: string) => f.trim().slice(0, 200)) : [];
     } catch { /* unparsable output */ }
     // LLM 成功（无论是否产出候选）即推进增量位置，避免同一批消息反复蒸馏；失败/中止路径已提前返回。
-    const advanceState = () => withFileMutationQueue(stateFile, () => withLock(stateFile, () => writeAtomically(stateFile, JSON.stringify({ lastHash: fingerprint(msgs[msgs.length - 1].role, msgs[msgs.length - 1].text), updatedAt: timestamp(), sessionId: currentSessionId ?? "" }))));
+    const advanceState = () => withFileMutationQueue(stateFile, () => withLock(stateFile, () => writeAtomically(stateFile, JSON.stringify({ lastHash: fingerprint(msgs[msgs.length - 1].role, msgs[msgs.length - 1].text), updatedAt: timestamp(), sessionId: currentState()?.sessionId ?? "" }))));
     if (!candidates.length) {
       await advanceState();
       return { content: [{ type: "text", text: "蒸馏未提取到合格候选（已推进增量位置）。" }], details: { count: 0, incremental } };
@@ -650,15 +813,42 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
   function registerProjectTools(): void {
     if (toolsRegistered) return;
     toolsRegistered = true;
+    projectToolsOwned = true;
+    pi.registerTool({
+      name: "memory-profile",
+      label: "Memory Profile",
+      description: "更新当前项目的 L2/L3 画像层（稳定拓扑、关键路径、约定）。与 STATUS（易变）和 FACTS（原子事实）分层；画像随 Brief 顶层注入，按需才下钻 FACTS。",
+      promptSnippet: "Update the project's stable profile layer (topology, key paths, conventions)",
+      promptGuidelines: ["Use memory-profile rarely for stable cross-session project identity; volatile state belongs in memory-status and atomic conclusions in memory-save; never include credential values."],
+      parameters: Type.Object({
+        // PROJECT.md is a bounded structural document, so allow Markdown lines
+        // while keeping the hard byte/line limits below and the content filter.
+        profile: Type.String({ minLength: 4, maxLength: 3600 }),
+      }),
+      executionMode: "sequential",
+      async execute(_id, params, _signal, _onUpdate, ctx) {
+        const current = requireSessionProject(ctx);
+        requireSafe(params.profile);
+        if (params.profile.split(/\r?\n/).length > 42) throw new Error("拒绝保存：PROJECT.md 画像最多 42 行，请只保留稳定结构。");
+        ensureProjectMeta(current);
+        const file = join(current.memoryDir, "PROJECT.md");
+        const next = `${DEFAULT_PROFILE_HEADER}\n\n> Updated: ${today()}\n\n${params.profile.trim()}\n`;
+        if (Buffer.byteLength(next, "utf8") > MAX_PROFILE_BYTES) throw new Error("拒绝保存：PROJECT.md 超过 4 KiB，请精简画像只保留稳定层。");
+        await withFileMutationQueue(file, () => withLock(file, () => writeAtomically(file, next)));
+        return { content: [{ type: "text", text: "已更新项目画像层（L2/L3）。" }], details: { projectKey: location.projectKey, kind: location.kind } };
+      },
+    });
     pi.registerTool({
       name: "memory-recall",
       label: "Memory Recall",
-      description: "读取当前项目的跨会话记忆。无参数返回状态和少量事实；提供 tags 时精确召回。",
+      description: "读取当前项目的跨会话记忆。无参数返回状态和少量事实；提供 tags 精确召回，提供 query 做 FTS5 关键词+标签混合召回；maxChars 限制聚合输出。",
       promptSnippet: "Load concise project memory by tag when prior context matters",
       promptGuidelines: ["Use memory-recall only when the injected brief is absent or domain details are needed; prefer precise tags."],
       parameters: Type.Object({
         tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 32 }), { maxItems: 8 })),
         maxItems: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
+        query: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+        maxChars: Type.Optional(Type.Integer({ minimum: 200, maximum: 4000 })),
       }),
       executionMode: "sequential",
       async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -666,25 +856,24 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
         const read = safeReadSet();
         if (read.risk) return { content: [{ type: "text", text: wrap("project_memory_recall", `⚠ 已阻止加载项目记忆：检测到 ${read.risk}。本次未输出记忆原文。`, 2400) }], details: { blocked: true } };
         const tags = normalizeTags(params.tags ?? []);
-        const facts = selectFacts(tags, params.maxItems ?? MAX_RECALL_FACTS, read.facts);
-        // 命中强化：剩余寿命不足一半的有效事实刷新验证日期，避免常用事实因 TTL 到期而失效（借鉴 PowerMem reinforce）。
-        const toReinforce = facts.filter((fact) => !isExpired(fact.verified, fact.ttlDays) && calendarAgeDays(fact.verified) > fact.ttlDays / 2).map((fact) => fact.id);
-        if (toReinforce.length) {
-          try {
-            await withFileMutationQueue(factsFile(), () => withLock(factsFile(), () => {
-              const raw = readText(factsFile());
-              const next = reinforceVerified(raw, toReinforce);
-              if (next !== raw) { validateFacts(next); writeAtomically(factsFile(), next); }
-            }));
-          } catch { /* 强化失败不影响召回结果 */ }
-        }
-        const expiring = expiringCount(read.facts);
+        const limit = params.maxItems ?? MAX_RECALL_FACTS;
+        const maxChars = params.maxChars ?? RECALL_DEFAULT_MAX_CHARS;
+        const query = params.query?.trim() ?? "";
+        // 混合召回：提供 query 时用 FTS5 关键词 + 标签 RRF 融合（借鉴 TAM hybrid）；否则保持标签/时间衰减行为。
+        const startedAt = Date.now();
+        const hybrid = query ? await hybridRecall(activeFacts(parseFacts(read.facts)), query, tags, limit) : undefined;
+        const facts = hybrid?.facts ?? selectFacts(tags, limit, read.facts);
+        const rendered = renderFactsWithinBudget(facts, maxChars);
+        // Recall is read-only: retrieval is not evidence that a fact was
+        // re-verified, so it must never refresh Verified or extend TTL.
+        const expiringFacts = facts.filter(isExpiringFact);
+        const focused = Boolean(query || tags.length);
         const body = [
-          `当前状态:\n${statusBrief(read.status, tags.length ? 300 : 480)}`,
-          facts.length ? `有效事实${tags.length ? `（${tags.map((tag) => `#${tag}`).join(" ")}）` : ""}:\n${facts.map((fact) => renderFact(fact)).join("\n\n")}` : "没有匹配的有效事实。",
-          expiring ? `⚠ ${expiring} 条事实即将到期（剩余 ≤20% TTL）；先复核再引用。` : "",
+          focused ? "" : `当前状态:\n${statusBrief(read.status, 480)}`,
+          facts.length ? `有效事实${query ? `（关键词: ${query}）` : tags.length ? `（${tags.map((tag) => `#${tag}`).join(" ")}）` : ""}:\n${rendered.text}` : "没有匹配的有效事实。",
+          expiringFacts.length ? `⚠ 本次命中的 ${expiringFacts.length} 条事实即将到期（剩余 ≤20% TTL）；先复核再引用。` : "",
         ].filter(Boolean).join("\n\n");
-        return { content: [{ type: "text", text: wrap("project_memory_recall", body, 2400) }], details: { projectKey: location.projectKey, tags, factIds: facts.map((fact) => fact.id) } };
+        return { content: [{ type: "text", text: wrap("project_memory_recall", body, Math.min(4000, Math.max(2400, maxChars + 800))) }], details: { projectKey: location.projectKey, tags, query: query || undefined, factIds: facts.map((fact) => fact.id), expiringFactIds: expiringFacts.map((fact) => fact.id), channels: hybrid?.channels ?? {}, keywordAvailable: hybrid?.keywordAvailable, noMatch: Boolean(query && !facts.length), factsTruncated: rendered.truncated, elapsedMs: Date.now() - startedAt } };
       },
     });
     pi.registerTool({
@@ -729,8 +918,10 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
           // 关联推荐（非自动替代）：保存后扫描活动事实，tags 重叠的旧条目提示可用 replaces 替代——
           // 推荐由 agent/用户决定，不自动覆盖，防止误替代污染。
           const related = currentFacts(parseFacts(next)).filter((fact) => fact.id !== id && fact.tags.some((tag) => tags.includes(tag)));
+          // 判重升级（借鉴 TAM 向量去重，本地用文本相似度替代）：标签重叠基础上，正文 token Jaccard ≥0.5 视为疑似重复，提示用 replaces 替代。
+          const nearDup = related.filter((fact) => jaccard(tokenizeWords(params.fact), tokenizeWords(`${fact.title} ${fact.body}`)) >= 0.5);
           const suggestion = related.length
-            ? ` 相关旧事实: ${related.map((fact) => `${fact.id}（${fact.title}）`).join("、")}。若本条是对其更新，请用 replaces=${related[0].id} 重新保存以替代。`
+            ? ` 相关旧事实: ${related.map((fact) => `${fact.id}（${fact.title}）`).join("、")}${nearDup.length ? `；其中 ${nearDup.map((fact) => fact.id).join("、")} 与本次内容高度相似（疑似重复）` : ""}。若本条是对其更新，请用 replaces=${related[0].id} 重新保存以替代。`
             : "";
           return { content: [{ type: "text", text: `已保存 ${id}（${tags.map((tag) => `#${tag}`).join(" ")}）。${suggestion}` }], details: { id, projectKey: location!.projectKey, kind: location!.kind, related: related.map((fact) => fact.id) } };
         }));
@@ -912,25 +1103,31 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    location = resolveLocation(ctx.cwd, trustedFor(ctx));
-    currentSessionId = ctx.sessionManager.getSessionId?.();
-    delegated = isProjectMemoryGuard(ctx.cwd, pi.getAllTools() as ToolMeta[]);
+    const state = activateSession(ctx, true);
     registerStatusTool();
     registerGlobalTools();
-    if (!delegated) registerProjectTools();
+    if (!state.delegated) registerProjectTools();
     const hf = handoffFile();
     if (existsSync(hf) && !readHandoffIfFresh()) { try { unlinkSync(hf); } catch { /* stale handoff cleanup */ } }
   });
-  pi.on("session_shutdown", async () => {
-    injectedKeys.delete(guardKey());
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const state = activateSession(ctx);
+    injectedKeys.delete(guardKey(state.sessionId));
+    sessions.delete(sessionKey(ctx));
   });
   pi.on("before_agent_start", async (event, ctx) => {
-    if (!location || !isSubstantive(event.prompt)) return;
+    const existing = sessions.get(sessionKey(ctx));
+    const conflicting = !existing ? hasConflictingKnownProject(ctx) : undefined;
+    if (conflicting) {
+      return { message: { customType: "project-memory-boundary", content: wrap("project_memory_boundary", `检测到工作目录已从 ${projectLabel(conflicting.location.projectRoot)} 切换。旧会话可能仍保留先前项目上下文；为避免混淆，本次不会加载或写入项目记忆。请在新项目根目录新建会话后继续。`, 500), display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), previousProjectKey: conflicting.location.projectKey } } };
+    }
+    const state = activateSession(ctx);
+    if (!isSubstantive(event.prompt)) return;
     if (!matchesSessionProject(ctx)) {
       return { message: { customType: "project-memory-boundary", content: wrap("project_memory_boundary", `检测到工作目录已从 ${projectLabel(location.projectRoot)} 切换。旧会话可能仍保留先前项目上下文；为避免混淆，本次不会加载或写入项目记忆。请在新项目根目录新建会话后继续。`, 500), display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), previousProjectKey: location.projectKey } } };
     }
     const preferences = buildGlobalPreferencesBrief();
-    if (delegated) {
+    if (state.delegated) {
       if (!preferences || hasCustomMessage(ctx, "global-memory-preferences")) return;
       return { message: { customType: "global-memory-preferences", content: preferences, display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), scope: "global-preference" } } };
     }
@@ -939,8 +1136,9 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     const handoff = readHandoffIfFresh();
     if (handoff && !hasBriefWithHandoff(ctx)) {
       const wrappedHandoff = wrap("project_memory_handoff", handoff, 500);
+      const handoffContent = hasBrief(ctx) ? wrappedHandoff : `${content}\n\n${wrappedHandoff}`;
       injectedKeys.add(guardKey(ctx.sessionManager.getSessionId?.()));
-      return { message: { customType: "project-memory-brief", content: `${content}\n\n${wrappedHandoff}`, display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), schemaVersion: MEMORY_SCHEMA_VERSION, projectKey: location.projectKey, handoff: true } } };
+      return { message: { customType: "project-memory-brief", content: handoffContent, display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), schemaVersion: MEMORY_SCHEMA_VERSION, projectKey: location.projectKey, handoff: true } } };
     }
     if (hasBrief(ctx)) return;
     if (injectedKeys.has(guardKey(ctx.sessionManager.getSessionId?.()))) return;
@@ -948,7 +1146,8 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
     return { message: { customType: "project-memory-brief", content, display: false, details: { source: "global-memory-guard", sessionId: ctx.sessionManager.getSessionId?.(), schemaVersion: MEMORY_SCHEMA_VERSION, projectKey: location.projectKey } } };
   });
   pi.on("session_before_compact", async (event, ctx) => {
-    if (!location || delegated) return;
+    const state = activateSession(ctx);
+    if (state.delegated) return;
     try {
       // 压缩前自动蒸馏（借鉴 OptMem nap）：把新增对话提炼为 INBOX 候选再压缩，候选仍由 review 审核；
       // 无模型/失败时安全跳过，绝不阻塞压缩。
@@ -963,8 +1162,25 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
       writeAtomically(handoffFile(), `<!-- HANDOFF ${timestamp()} [compact:${reason}] -->\n${content}`);
     } catch { /* Handoff never interrupts compaction. */ }
   });
-  pi.on("tool_result", async (event) => {
-    if (!location || delegated || event.toolName.startsWith("memory-")) return;
+  pi.on("turn_end", async (event, ctx) => {
+    const state = activateSession(ctx);
+    if (state.delegated || AUTO_DISTILL_TURNS <= 0) return;
+    try {
+      // 只统计用户/助手产生实质文本的轮次（TAM everyNConversations 思想的 opt-in 版）。
+      const text = (Array.isArray(event.message?.content) ? event.message.content : [])
+        .filter((c: any) => c?.type === "text" && typeof c.text === "string" && c.text.trim()).map((c: any) => c.text).join(" ").trim();
+      if (!text) return;
+      state.autoDistillTurns++;
+      if (state.autoDistillTurns < AUTO_DISTILL_TURNS) return;
+      state.autoDistillTurns = 0;
+      // fire-and-forget：不 await，避免阻塞 pi 的下一轮处理；内部所有错误被隔离，绝不中断会话。
+      runDistill(ctx, undefined, 1).catch(() => { /* never interrupts */ });
+    } catch { /* never interrupts */ }
+  });
+  pi.on("tool_result", async (event, ctx) => {
+    if (!ctx) return; // Older Pi events without context must not attribute a write to another session.
+    const state = activateSession(ctx);
+    if (state.delegated || event.toolName.startsWith("memory-")) return;
     try {
       if (event.isError) {
         const errorText = (event.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text ?? "").join(" ").replace(/\n+/g, " ").trim();
@@ -989,7 +1205,7 @@ export default function globalMemoryGuard(pi: ExtensionAPI) {
   pi.registerCommand("memory-project", {
     description: "显示当前项目的全局路由记忆状态",
     handler: async (_args, ctx) => {
-      if (!location) return;
+      activateSession(ctx);
       const parsed = parseFacts(readText(factsFile()));
       const active = activeFacts(parsed).length;
       const stale = currentFacts(parsed).filter((fact) => isExpired(fact.verified, fact.ttlDays)).length;

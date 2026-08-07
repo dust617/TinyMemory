@@ -3,3 +3,15 @@ node_modules/
 scan.mjs
 .publish/
 .tmp/
+
+# Local runtime memory and conversation data must never be published.
+.pi/memory/
+archive/
+session-exports/
+*.jsonl
+*.log
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+!.env.example
